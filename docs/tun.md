@@ -129,18 +129,20 @@ tun:
 ```
 
 Status per platform — "implemented" means the code path exists, compiles
-and is unit-tested; only Linux has been exercised with real routes:
+and is unit-tested; all three have been exercised with real routes (the
+scope of each run is in the table):
 
 | Platform | Outbound binding | Interface auto-detection | Status |
 |----------|------------------|--------------------------|--------|
-| Linux | `SO_BINDTODEVICE` (by name) | `/proc/net/route` | IPv4 exercised in a privileged container (#695); not yet on a bare host. |
-| macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` (by index) | routing table, unscoped `0.0.0.0/0` | **Experimental, not yet verified on a real host.** The socket binding itself is tested unprivileged; global routes on a `utun` are not. |
-| Windows | `IP_UNICAST_IF` / `IPV6_UNICAST_IF` (by index) | routing table, lowest route + interface metric | **Experimental, not yet verified on a real host.** Compile-checked only. |
+| Linux | `SO_BINDTODEVICE` (by name) | `/proc/net/route` | **Verified** for IPv4 and IPv6 with real routes in privileged containers (Linux 6.8, aarch64, musl build) — see *What was verified on Linux* below. Not yet run on a bare host. |
+| macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` (by index) | routing table, unscoped `0.0.0.0/0` | Experimental. IPv4 and IPv6 exercised in a macOS 26.6 VM (arm64, single interface, DIRECT outbound) — see *Verified on macOS* below; not yet on a multi-interface host or through a proxy outbound. |
+| Windows | `IP_UNICAST_IF` / `IPV6_UNICAST_IF` (by index) | routing table, lowest route + interface metric | Experimental. IPv4 and IPv6 exercised on Windows 11 arm64 with a Wintun adapter and one physical NIC (DIRECT outbound): auto-detected and explicit alias, TCP + UDP, runtime reload, teardown. Choosing between several default routes by metric is unit-tested only. |
 
-IPv6 capture (`inet6-address`) is **experimental and not yet verified on a
-real host on any platform**: the userspace stack is unit-tested carrying
-IPv6 TCP and UDP flows, but the device address and the IPv6 routes have
-not been exercised.
+IPv6 capture (`inet6-address`) is **experimental**. It has been exercised
+in the same three setups: the device gets the address, the IPv6 routes
+are installed and removed, and IPv6 TCP and UDP flows are captured and
+relayed. A public IPv6 destination was reached on macOS and Windows; the
+Linux lab had no IPv6 uplink.
 
 How each loop-avoidance piece works:
 
@@ -151,6 +153,22 @@ How each loop-avoidance piece works:
    crash. With `inet6-address` set, `::/1` and `8000::/1` are installed the
    same way; without it no IPv6 route is installed and IPv6 traffic keeps
    bypassing the device.
+
+   **macOS installs a different set**, because a route whose destination
+   is the all-zero address breaks the outbound binding there: a socket
+   scoped with `IP_BOUND_IF` to the primary interface has no scoped route
+   of its own, so the kernel falls back to looking the default route up
+   by key (`0.0.0.0` / `::`) — and finds `0.0.0.0/1` on the `utun`
+   instead of the real default. The interface does not match the
+   socket's, and every dial meow makes fails with `Network is
+   unreachable` (IPv6: `No route to host`), for destinations in both
+   halves. So on macOS the lower half is covered without that key:
+   `1.0.0.0/8`, `2.0.0.0/7`, `4.0.0.0/6`, `8.0.0.0/5`, `16.0.0.0/4`,
+   `32.0.0.0/3`, `64.0.0.0/2`, plus `128.0.0.0/1` — and for IPv6
+   `100::/8`, `200::/7`, `400::/6`, `800::/5`, `1000::/4`, `2000::/3`,
+   `4000::/2`, plus `8000::/1`. The skipped `0.0.0.0/8` is never a
+   destination; the skipped `::/8` contains the IPv4-mapped and NAT64
+   (`64:ff9b::/96`) ranges, which are therefore not captured on macOS.
 2. **Outbound interface binding.** Every outbound socket meow creates (proxy
    upstream dials including Hysteria2's QUIC socket, DIRECT, DNS upstreams,
    marked sockets) is bound to the physical interface *before*
@@ -205,28 +223,164 @@ Scope and caveats:
   mode adds IP-literal capture on top rather than replacing the DNS flow.
 - Requires root/`CAP_NET_ADMIN` (Administrator on Windows) like the rest
   of the TUN inbound.
+- **Only traffic that follows the default route is captured.** The `/1`
+  routes lose to anything more specific, so destinations on a directly
+  connected subnet (the LAN, a Docker bridge) and any static route you
+  added keep using their own interface and never reach meow.
+- **Inbound connections from outside the local subnet break while global
+  mode is on.** The reply to a connection accepted on the physical
+  interface is routed like any other outgoing packet — into the device —
+  and never reaches the peer (observed on Linux: a remote client times
+  out; with TUN off it connects). That covers an SSH session from another
+  subnet, a server on the host, and meow's own `allow-lan` listeners and
+  `external-controller`. Peers on the directly connected subnet are
+  unaffected (more-specific route). meow does not install policy-routing
+  rules to exempt reply traffic; do not enable global mode on a machine
+  you only reach from a remote network.
+- **`ping` proves nothing.** The userspace stack answers ICMP echo itself
+  for *every* address routed into the device, so `ping 203.0.113.77`
+  "succeeds" for a host that does not exist. Probe with TCP or UDP.
+- **Teardown.** A normal stop (SIGINT/SIGTERM, or a reload that disables
+  TUN) removes the `/1` routes and the device and restores
+  `/etc/resolv.conf`. After a `kill -9` on Linux the kernel destroys the
+  device and with it the device address and every route through it — no
+  `/1` route is left and IP connectivity is back at once — but the
+  `dns-hijack` resolver redirect survives: `/etc/resolv.conf` still names
+  the fake-ip gateway, so name resolution fails until meow starts again
+  (it recovers the original from `/etc/resolv.conf.meow-backup`) or you
+  restore that file by hand.
 
-Verification on a Linux host (or VM):
+Verification on a Linux host (or VM). Pick targets *off* the local subnet
+(see above), and make sure `curl` is not itself configured to use a proxy
+(`http_proxy` / `https_proxy` in the environment bypass the TUN):
 
 ```bash
-sudo ./meow -f config.yaml            # global mode active
-curl 1.1.1.1                          # IP literal — captured (check meow logs)
+sudo ./meow -f config.yaml            # global mode active; the log shows
+                                      #   outbound sockets bound to interface 'eth0' (SO_BINDTODEVICE)
+ip route | grep '/1 dev'              # 0.0.0.0/1 and 128.0.0.0/1 on the tun device
 ip route get 1.1.1.1                  # shows the tun device
+curl 1.1.1.1                          # IP literal — captured (check meow logs)
 curl https://example.com              # domain flow — still captured
-# teardown: stop meow, then confirm both /1 routes are gone:
-ip route | grep -c '/1 dev' # → 0
+dig @9.9.9.9 example.com              # UDP: answered by dns-hijack with a fake IP
+# no loop: meow's own dials leave by the physical interface, never the tun
+sudo tcpdump -ni eth0 'tcp[tcpflags] & tcp-syn != 0'       # the outbound SYNs
+sudo tcpdump -ni meow-tun src host <eth0 address>          # stays empty
+# with tun.inet6-address set:
+ip -6 addr show dev meow-tun          # the configured address
+ip -6 route | grep '/1 dev'           # ::/1 and 8000::/1 on the tun device
+curl 'http://[2606:4700:4700::1111]/' # IPv6 literal — captured (the reply needs
+                                      #   IPv6 connectivity on the physical interface)
+# teardown: stop meow, then confirm all /1 routes are gone:
+{ ip route; ip -6 route; } | grep -c '/1 dev' # → 0
 ```
 
-The same checks, not yet run by the maintainers, on macOS and Windows —
-please report results on #375:
+### What was verified on Linux
+
+Run for #375 in privileged containers (Docker on a Linux 6.8 aarch64 VM,
+`aarch64-unknown-linux-musl` build with default features): a client
+container whose default route points at a router container, and a server
+container behind that router, so the test targets are reached through the
+default route rather than an on-link one. Not run on a bare host, and not
+with systemd-resolved or NetworkManager managing the resolver.
+
+- **Startup**: the interface is auto-detected (`eth0`), the binding is
+  logged before the first dial, `0.0.0.0/1` + `128.0.0.0/1` go into the
+  device; with `inet6-address` the device carries the address and
+  `::/1` + `8000::/1` are added.
+- **Capture**: IP-literal TCP and UDP, IPv4 and IPv6, to the server
+  container and (IPv4) to a public address; domains through `dns-hijack`
+  and fake-ip; the same through a SOCKS5 outbound (TCP and UDP ASSOCIATE)
+  whose server is a hostname. 64 MiB transfers arrive bit-identical in
+  both families.
+- **No loop**: every outbound SYN / datagram shows on `eth0` with the
+  physical source address and none on the device, across 200 concurrent
+  connections and 100 UDP flows; CPU is idle afterwards and the
+  connection table drains.
+- **Teardown**: SIGTERM removes all four `/1` routes, the device and the
+  resolver redirect, and direct connectivity is back; `kill -9` leaves
+  only the resolver redirect (see *Teardown* above).
+- **Reloads** (`PUT /configs`): off → global, global → off, global →
+  global (`mtu` change, adding/removing `inet6-address`) and a reload
+  into a bogus `outbound-interface` (TUN ends up off, no routes) all leave
+  routes, device and resolver consistent; 30 consecutive global → global
+  restarts keep the device name.
+- **Fail-closed**: a non-existent `outbound-interface`, or no IPv4 default
+  route to auto-detect from, starts meow without the TUN listener and
+  without any `/1` route.
+
+The same checks on macOS:
 
 ```bash
-# macOS
 sudo ./meow -f config.yaml
 route -n get 1.1.1.1 | grep interface   # → the utun device
 curl 1.1.1.1                            # captured (check meow logs)
-netstat -rn -f inet | grep '/1'         # after stopping meow: no 0/1, 128.0/1
+netstat -rn -f inet | grep -c utun      # after stopping meow: 0
 ```
+
+### Verified on macOS
+
+Run on macOS 26.6 (arm64 VM, one interface `en0`, `MATCH,DIRECT`), each
+checked against meow's log and `tcpdump` on both `en0` and the `utun`:
+
+- Startup auto-detects `en0`, logs the `IP_BOUND_IF` binding and installs
+  the eight IPv4 routes above on the `utun`; an explicit
+  `outbound-interface: en0` behaves the same, and a non-existent
+  interface fails closed — the device is removed, no route is installed
+  and the rest of meow keeps running with TUN off.
+- IP-literal TCP (`curl http://1.1.1.1`) and fake-ip domain flows are
+  captured and relayed. meow's own dial leaves `en0` from the interface
+  address; nothing sourced from that address re-enters the `utun`, and
+  CPU and the connection count stay flat over an idle minute.
+- UDP round-trips through the device (`dig @223.5.5.5` with `dns-hijack`
+  off, NTP).
+- Loopback is unaffected: the REST API, a `127.0.0.1` listener, and a
+  dial meow itself makes to `127.0.0.1` through the mixed port.
+- With `inet6-address`: the address is assigned, the eight IPv6 routes
+  are installed, and IPv6-literal TCP and UDP flows are captured and
+  leave `en0` from its IPv6 address.
+- A global → global reload (`PUT /configs` changing `mtu`) comes back
+  with routes and binding intact.
+- SIGTERM removes every route, the device and the DNS override. After
+  `kill -9` the kernel destroys the `utun` and its routes with the
+  process, so connectivity returns on its own — but with `dns-hijack`
+  the system DNS servers stay pointed at the fake-ip gateway and name
+  resolution is broken until meow is started and stopped cleanly once
+  (or `networksetup -setdnsservers <service> empty`).
+
+Not covered by that run: proxy outbounds (only DIRECT was dialed), a
+host with several active interfaces, and an interface whose index
+changes under a running listener.
+
+### Verified on Windows
+
+Run on Windows 11 arm64 (VM, Wintun adapter, one physical NIC `Ethernet`,
+`MATCH,DIRECT`):
+
+- Startup auto-detects the physical adapter, logs the `IP_UNICAST_IF`
+  binding and puts `0.0.0.0/1` + `128.0.0.0/1` on the Wintun adapter; an
+  explicit `outbound-interface: Ethernet` (the interface *alias*) behaves
+  the same, and an unknown alias fails closed — no routes, no adapter,
+  meow keeps running without TUN.
+- IP-literal TCP and UDP to a LAN and a public address, and a domain
+  through `dns-hijack` / fake-ip, are captured and relayed; meow's own
+  dial leaves from the physical address while the captured client socket
+  sits on the TUN address, and CPU and the connection count stay flat.
+- The REST API on `127.0.0.1` keeps answering with the routes up.
+- With `inet6-address` the adapter gets the address, `::/1` + `8000::/1`
+  are installed, and IPv6 TCP and UDP to public addresses are relayed.
+- A `PUT /configs` out of and back into global scope removes and
+  restores routes, adapter and DNS.
+- A hard kill (`taskkill /F`) cannot leak the routes — they disappear
+  with the Wintun adapter — but with `dns-hijack` it leaves the physical
+  adapter's DNS servers pointing at `127.0.0.1` / `::1`, so name
+  resolution fails until meow runs again: the next start detects the
+  leftover and resets the adapter to DHCP DNS when it stops cleanly.
+
+Not covered by that run: proxy outbounds (only DIRECT was dialed) and
+choosing between several default routes by metric (one NIC).
+
+Still to be run by the maintainers on Windows — please report results
+on #375:
 
 ```powershell
 # Windows (elevated)
@@ -244,8 +398,8 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
-| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the `::/1` + `8000::/1` routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
-| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental; macOS and Windows not yet verified on a real host, see above); `false` = nothing. |
+| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
+| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental, see above); `false` = nothing. |
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
