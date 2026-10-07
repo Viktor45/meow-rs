@@ -1,0 +1,98 @@
+# Focused proof build for armv7-unknown-linux-musleabihf.
+#
+# This file lives on the FORK's default branch only — it is deliberately NOT
+# part of the upstream PR. Purpose: produce a short, readable, public build log
+# for the new release target, since no upstream workflow with a `pull_request`
+# trigger calls build.yml (only release.yml on tags and alpha.yml on pushes to
+# main do), so a reviewer cannot otherwise see this target build before merge.
+#
+# It reuses scripts/build-armv7-musl.sh from the checked-out ref, so it builds
+# exactly the code under review. Run it with:
+#
+#   gh workflow run armv7-musl-proof.yml --repo Viktor45/meow-rs \
+#     -f ref=build/armv7-musl-target
+
+name: armv7-musl proof build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or ref in this fork to build"
+        required: false
+        default: "build/armv7-musl-target"
+      tag:
+        description: "meow-rs version passed to the binary (MEOW_VERSION_SUFFIX)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Same env var crates/meow-app/build.rs reads for the rolling alpha.
+      MEOW_VERSION_SUFFIX: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          # The container builds with the pinned toolchain, which does not
+          # match the runner's rustc, so key on the lockfile + pin instead of
+          # on rustc -vV (what Swatinem/rust-cache would do).
+          key: armv7-musl-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            armv7-musl-${{ runner.os }}-
+
+      # binfmt is not guaranteed on the runner image, and the smoke test below
+      # needs to execute an armv7 binary.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build (musl cross toolchain container)
+        run: |
+          set -euo pipefail
+          # Tag suffix is the RUNNER's architecture (ubuntu-latest is x86_64),
+          # not the target's. Same command as docs/recipe below.
+          docker run --rm -v "$PWD:/src" -w /src \
+            messense/rust-musl-cross:armv7-musleabihf-amd64 \
+            bash scripts/build-armv7-musl.sh
+
+      - name: Linkage report
+        run: |
+          set -euo pipefail
+          bin=target/armv7-unknown-linux-musleabihf/release/meow
+          # The whole point of this target: no glibc, no dynamic loader. If
+          # ldd ever resolves something here, the release would break on
+          # Alpine armhf exactly the way the gnu build does.
+          file "$bin"
+          ldd "$bin" 2>&1 || true
+          ls -l "$bin"
+
+      - name: Smoke test (qemu-armv7)
+        run: |
+          set -euo pipefail
+          # Static musl binary: any armv7 image will do. alpine:3.20 still
+          # publishes armhf; `latest` may not.
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD/target/armv7-unknown-linux-musleabihf/release:/out:ro" \
+            alpine:3.20 /out/meow -v
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD/target/armv7-unknown-linux-musleabihf/release:/out:ro" \
+            -v "$PWD:/w:ro" \
+            alpine:3.20 /out/meow -t -d /tmp -f /w/config.example.yaml
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-armv7-unknown-linux-musleabihf
+          path: target/armv7-unknown-linux-musleabihf/release/meow
+          if-no-files-found: error
+          retention-days: 30
