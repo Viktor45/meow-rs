@@ -52,8 +52,18 @@ jobs:
         include:
           # Every release target builds with the meow-app default feature set
           # (`full`; TLS is BoringSSL). Targets that cannot link boring-sys
-          # (MIPS, 32-bit musl, windows-gnu) are not shipped and — since the
-          # rustls backend was removed — cannot be built with TLS at all.
+          # (MIPS, windows-gnu) are not shipped and — since the rustls backend
+          # was removed — cannot be built with TLS at all.
+          #
+          # 32-bit musl used to be on that list too, but only because of the
+          # linker: zig's musl headers declare time_t as 64-bit on 32-bit
+          # targets (musl's Y2038 hardening) while Rust's libc crate uses i32,
+          # so bindgen emits a 64-bit X509_VERIFY_PARAM_set_time and `boring`
+          # fails to compile. A real musl cross toolchain declares time_t as a
+          # plain 32-bit type and has no such disagreement, so the 32-bit musl
+          # target now builds in a container (scripts/build-armv7-musl.sh)
+          # instead of via cargo-zigbuild. Such targets carry `toolchain:` and
+          # skip the zig steps below.
           # Linux musl
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
@@ -83,6 +93,21 @@ jobs:
             runner: ubuntu-latest
             minimal_budget_bytes: 0
             minimal_soft_gate: true
+          # Static musl for 32-bit ARM routers (MikroTik hEX/ARM, older
+          # OpenWrt devices). The gnu build above is dynamically linked and
+          # needs GLIBC_2.28, which Alpine's armhf gcompat does not provide,
+          # so `execve` fails with ENOENT on a file that exists; this one has
+          # neither dependency. No OpenWrt arch labels yet — the maintainers
+          # pick the CPU baselines (arm_cortex-a7_neon-vfp4 and friends), see
+          # ADR-0007 for the armv7-musl status.
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+            openwrt_archs: ''
+            # Suffix is the RUNNER's architecture, not the target's
+            # (ubuntu-latest is x86_64 today).
+            toolchain: messense/rust-musl-cross:armv7-musleabihf-amd64
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             minimal_budget_bytes: 0
@@ -138,15 +163,32 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Install cargo-zigbuild and zig
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.toolchain == ''
         uses: mlugg/setup-zig@v1
         with:
           version: 0.13.0
 
       - run: cargo install --locked cargo-zigbuild
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.toolchain == ''
+
+      # Targets with a `toolchain:` image build inside it, with the checkout
+      # bind-mounted at /src. The script writes target/<triple>/release/meow
+      # on the host, so the packaging steps below are unchanged — and so
+      # rust-cache above keeps caching the expensive part across runs. Only
+      # the crate registry is re-fetched inside the container each run, which
+      # costs seconds to a minute, not minutes.
+      - name: Build release binary in musl cross toolchain
+        if: matrix.toolchain != ''
+        shell: bash
+        env:
+          TOOLCHAIN_IMAGE: ${{ matrix.toolchain }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src \
+            "$TOOLCHAIN_IMAGE" bash scripts/build-armv7-musl.sh
 
       - name: Build release binary
+        if: matrix.toolchain == ''
         shell: bash
         run: |
           # Default features = full (meow-app/Cargo.toml); TLS is BoringSSL.
