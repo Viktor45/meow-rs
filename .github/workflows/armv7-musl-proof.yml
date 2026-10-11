@@ -61,7 +61,9 @@ jobs:
           set -euo pipefail
           # Tag suffix is the RUNNER's architecture (ubuntu-latest is x86_64),
           # not the target's. Same command as docs/recipe below.
-          docker run --rm -v "$PWD:/src" -w /src \
+          # -e forwards the job env so MEOW_VERSION_SUFFIX reaches the build
+          # inside the container - the same fix PR #744 applies to build.yml.
+          docker run --rm -e MEOW_VERSION_SUFFIX -v "$PWD:/src" -w /src \
             messense/rust-musl-cross:armv7-musleabihf-amd64 \
             bash scripts/build-armv7-musl.sh
 
