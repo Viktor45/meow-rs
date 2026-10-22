@@ -267,6 +267,7 @@ flowchart TD
 | `meow-config` | YAML configuration parsing, subscription fetcher, config persistence |
 | `meow-api` | REST API (Axum) + embedded web UI |
 | `meow-app` | CLI entry point |
+| `meow-cli` | `meow-cli`: controls a running meow over the REST API |
 
 ## Quick Start
 
@@ -407,6 +408,20 @@ http://127.0.0.1:9090/ui
 ```
 
 From the **Subscriptions** tab you can add a Clash subscription URL to import proxies, groups, and rules automatically.
+
+### Control it from the shell
+
+`meow-cli` ships beside `meow` in the desktop release archives (Windows, macOS, Linux glibc) and drives the same REST API. On the machine meow runs on, as the same user, it needs no options: once `external-controller` is up, meow writes its address and secret to a file only that user can read, and meow-cli reads it.
+
+```bash
+./target/release/meow-cli status
+./target/release/meow-cli group select "Proxy" "HK 01"
+./target/release/meow-cli conn list --filter youtube
+```
+
+`--controller` and `--config` (which reads `external-controller` and `secret` from a config) point it elsewhere.
+
+`--json` prints the API's answers for scripts. Those archives also carry an agent skill in `skills/meow-cli/` that teaches a coding agent to use it; `meow-cli skill` prints its `SKILL.md`. See the [meow-cli guide](https://meow-rs.github.io/meow-rs/guide/meow-cli).
 
 ### Use the Proxy
 

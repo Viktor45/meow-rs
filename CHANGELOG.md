@@ -8,6 +8,33 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`meow-cli`, a command-line controller for a running meow**: a second
+  binary, shipped beside `meow` in the desktop release archives (Windows,
+  macOS, Linux glibc on x86_64 and aarch64), that drives the
+  REST API from a shell or a script. It shows status, switches the mode,
+  log level and TUN, lists groups and switches, pins or unpins their
+  members, delay-tests groups and proxies, lists rules, lists, inspects and
+  closes connections, queries and flushes DNS, updates providers and
+  subscriptions, reads the logbook, follows the log and traffic, and
+  reloads a config file. On the machine meow runs on, as the same user, it
+  needs no options: once its `external-controller` is up, meow writes the
+  address and the API secret to a file only that user can read, and
+  removes it on exit, so meow-cli also finds a meow that a desktop GUI
+  started with the secret on its command line. `--controller` and
+  `--config` name another address, and that meow's file still supplies the
+  secret when it bound exactly that address; `MEOW_SECRET` and
+  `--secret-stdin` override it. There is no secret flag, so the secret
+  never lands in shell history. A meow running as root
+  publishes in `/var/run/meow`, for root; the systemd unit `meow install`
+  writes now creates that directory (`RuntimeDirectory=meow`).
+  `--json` prints the API's answers for scripts. The same archives carry
+  an agent skill in `skills/meow-cli/`, in the Agent Skills format, that
+  teaches a coding agent to use it, including which commands change state;
+  `meow-cli skill` prints its `SKILL.md`. The crate is not published on crates.io,
+  where the name belongs to an unrelated crate.
+
 ### Changed
 
 - **The logbook links the system SQLite on iOS and tvOS**: with the
