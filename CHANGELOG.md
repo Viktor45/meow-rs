@@ -111,6 +111,18 @@ the canonical, in-repo source a release is cut from.
   referenced — the referenced set is a startup snapshot a `PUT
   /configs` does not widen, the Country MMDB is still never a tick
   target, and an all-false set leaves the tick a no-op.
+- **The YAML parser comes from `serde_norway`**: the config parser links
+  `serde_norway` 0.9.42 instead of `serde_yaml` 0.9.34, which pulls the
+  archived `unsafe-libyaml` (RUSTSEC-2024-0449). The two crates are the same
+  0.9.34 source with the same public API; only the libyaml backend differs,
+  and it now comes from the maintained `unsafe-libyaml-norway` fork. YAML
+  parsing, including anchors, merge keys, tags and error messages, is
+  unchanged. The public `meow-config` types that expose a YAML value now
+  name `serde_norway::Value` instead of `serde_yaml::Value` — `RawConfig`'s
+  `proxies`, `firewall` and `udp` passthroughs, `RawGeoDataConfig`'s
+  `geodata-mode`, `RawTun`'s upstream-only fields, and the rest. The two
+  are distinct types: an embedder that reads such a field has to depend on
+  `serde_norway` as well.
 
 ### Removed
 
