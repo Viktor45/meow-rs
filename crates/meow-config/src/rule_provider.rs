@@ -976,9 +976,10 @@ fn cache_needs_revalidation(modified: Option<SystemTime>, interval: u64) -> bool
 ///
 /// Returns a map from provider name to `Arc<RuleProvider>`.  Providers that
 /// fail to load are skipped with a `warn!` (best-effort keep-running);
-/// under `strict` definition/payload defects return `Err` instead, while
-/// pure acquisition failures still register the provider empty (issue
-/// #533).
+/// under `strict`, definition defects and *local* (`file:`/`inline:`)
+/// payload defects return `Err` instead, while remote payload defects
+/// degrade like pure acquisition failures: the provider registers empty
+/// in either mode and retries in the background (issue #533).
 pub fn load_providers(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
@@ -1075,6 +1076,16 @@ pub fn load_providers_prefetched(
                 // failing strict validation as "unknown provider") and a
                 // later `PUT /providers/rules/{name}` refresh can heal it.
                 // Matches mihomo, which registers failed providers.
+                //
+                // Remote *payload* parse defects funnel here too — a feed's
+                // malformed bytes are third-party content the operator
+                // cannot fix by editing the config, so they take the same
+                // registered-empty + background-retry shape. That is a
+                // deliberate lenient-side change: such a defect used to
+                // drop the provider outright until the next config reload;
+                // the spec (§4.2 "registered empty in both modes") and
+                // upstream's failed-provider registration both prefer the
+                // retryable shape.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
                 // A download still running at the deadline is not a
                 // failure; the adopted download records its own outcome.
@@ -1422,11 +1433,36 @@ fn load_http(
         parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
     };
     match entry {
-        Prefetched::Fresh(bytes) => {
-            provider.fill_fresh(parse(bytes).map_err(LoadError::Payload)?);
-        }
+        // Caller-supplied bytes for an http provider are still remote
+        // content — degrade a parse defect like a fetched one (registered
+        // empty + retry), never a config verdict on third-party bytes.
+        Prefetched::Fresh(bytes) => match parse(bytes) {
+            Ok(parsed) => provider.fill_fresh(parsed),
+            Err(e) => {
+                provider.owe(InitialFetch::Retry);
+                return Err(LoadError::Acquisition(
+                    Box::new(provider),
+                    e.context("ignoring the payload, which does not parse"),
+                ));
+            }
+        },
         Prefetched::Downloaded { bytes, persisted } => {
-            provider.fill_fresh(parse(bytes).map_err(LoadError::Payload)?);
+            match parse(bytes) {
+                // Remote bytes are third-party content: a strict parse
+                // defect degrades to the acquisition shape rather than
+                // rejecting the build — the feed's owner cannot veto the
+                // daemon by serving malformed rules.
+                Err(e) => {
+                    provider.owe(InitialFetch::Retry);
+                    return Err(LoadError::Acquisition(
+                        Box::new(provider),
+                        e.context("ignoring the payload, which does not parse"),
+                    ));
+                }
+                Ok(parsed) => provider.fill_fresh(parsed),
+            }
+            // Rejected bytes never reach the cache — only a payload that
+            // parsed is persisted.
             if let Some(path) = &cache_path {
                 if !persisted.swap(true, Ordering::Relaxed) {
                     write_cache(path, bytes);
@@ -1444,13 +1480,11 @@ fn load_http(
                     provider.owe(InitialFetch::Revalidate);
                 }
             }
-            // Offline validation (`-t`) validates the cache itself: it is
-            // the payload the next start serves.
-            Err(e) if crate::is_offline_validate() => return Err(LoadError::Payload(e)),
-            // Otherwise a cache that no longer parses (a different
-            // `format:`, a payload an older build cached unparsed) is not a
-            // config defect: start empty and let the background fetch
-            // replace it.
+            // A cache that no longer parses (a different `format:`, a
+            // payload an older build cached unparsed) is remote content
+            // at rest, not a config defect — even under `-t`, whose
+            // verdict must match what the next boot does: start empty and
+            // let the background fetch replace it.
             Err(e) => {
                 provider.owe(InitialFetch::Retry);
                 return Err(LoadError::Acquisition(
@@ -1769,7 +1803,7 @@ fn fetch_http_blocking(
 }
 
 /// Extract a human-readable message from a thread panic payload.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -3316,5 +3350,178 @@ header:
         supervisor.reconcile(&registry);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(origin.hits(), 1, "a later commit does not fetch again");
+    }
+
+    /// `123` is a non-string payload item — under strict the whole
+    /// ruleset rejects, which used to make the *load* fatal too.
+    const MIXED_BAD: &str = "payload:\n  - 'good.example'\n  - 123\n";
+
+    /// A remote payload defect is third-party content: under strict it
+    /// registers the provider empty and owes `InitialFetch::Retry` — the
+    /// same acquisition shape a transport failure produces — instead of
+    /// failing the build. The rejected bytes never reach the cache.
+    #[tokio::test]
+    async fn strict_remote_rule_payload_registers_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([(
+            "p".to_string(),
+            http_provider("http://127.0.0.1:1/rules.yaml", 0),
+        )]);
+        let mut prefetched = PrefetchedPayloads::default();
+        prefetched.entries.insert(
+            "p".to_string(),
+            Prefetched::Downloaded {
+                bytes: MIXED_BAD.as_bytes().to_vec(),
+                persisted: AtomicBool::new(false),
+            },
+        );
+        let mut dropped = DroppedProviders::default();
+        let out = load_providers_prefetched(
+            &raw,
+            Some(dir.path()),
+            &ctx(),
+            None,
+            &|_| None,
+            &prefetched,
+            None,
+            true,
+            &mut dropped,
+        )
+        .expect("a remote payload defect must degrade under strict, not fail");
+        let p = out.get("p").expect("the provider registers empty");
+        assert_eq!(p.rule_count(), 0);
+        assert!(
+            dropped.is_empty(),
+            "a degraded provider is registered, not dropped"
+        );
+        assert!(
+            matches!(*p.initial_fetch.lock(), InitialFetch::Retry),
+            "the provider owes the background retry"
+        );
+        // The cache write is gated on a successful parse — the rejected
+        // bytes are never persisted.
+        assert!(
+            !cache_file(dir.path(), "p").exists(),
+            "rejected remote bytes must not poison the cache"
+        );
+        // The owed fetch starts (127.0.0.1:1 refuses — a retry, not a spin).
+        let fetch = p.spawn_initial_fetch();
+        assert!(fetch.is_some(), "Retry must spawn the initial fetch");
+    }
+
+    /// A corrupt remote-derived cache degrades too — remote content at
+    /// rest, not operator-authored bytes. The `is_offline_validate` fatal
+    /// special case is gone, so the same arm serves `-t` and boot alike.
+    /// The `-t` arm pins itself in a child process: `set_offline_validate`
+    /// is a one-way process-global flag a parallel sibling test's prefetch
+    /// could observe inside even the narrowest window.
+    #[test]
+    fn strict_corrupt_cache_degrades() {
+        if std::env::var_os("MEOW_OFFLINE_VALIDATE_CHILD").is_some() {
+            crate::set_offline_validate(true);
+            corrupt_cache_degrades();
+            return;
+        }
+        corrupt_cache_degrades();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "rule_provider::tests::strict_corrupt_cache_degrades",
+                "--exact",
+            ])
+            .env("MEOW_OFFLINE_VALIDATE_CHILD", "1")
+            .status()
+            .expect("spawn the -t arm child");
+        assert!(
+            status.success(),
+            "the corrupt cache must degrade under -t too"
+        );
+    }
+
+    /// One `strict_corrupt_cache_degrades` pass — identical verdict under
+    /// boot and under `set_offline_validate(true)` (the `-t` arm).
+    fn corrupt_cache_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([(
+            "p".to_string(),
+            http_provider("http://127.0.0.1:1/rules.yaml", 0),
+        )]);
+        let mut prefetched = PrefetchedPayloads::default();
+        prefetched.entries.insert(
+            "p".to_string(),
+            Prefetched::Cached {
+                bytes: MIXED_BAD.as_bytes().to_vec(),
+                modified: Some(SystemTime::now()),
+            },
+        );
+        let mut dropped = DroppedProviders::default();
+        let out = load_providers_prefetched(
+            &raw,
+            Some(dir.path()),
+            &ctx(),
+            None,
+            &|_| None,
+            &prefetched,
+            None,
+            true,
+            &mut dropped,
+        )
+        .expect("a corrupt cache must degrade, not fail strict");
+        let p = out.get("p").expect("the provider registers empty");
+        assert_eq!(p.rule_count(), 0);
+        assert!(dropped.is_empty());
+        assert!(matches!(*p.initial_fetch.lock(), InitialFetch::Retry));
+    }
+
+    /// Whether a bad payload lands before or after the fetch deadline the
+    /// strict verdict is identical: registered empty, retry owed. The
+    /// pending download (deadline-exceeded) adopts instead — also
+    /// registered empty — and fills when it lands.
+    #[tokio::test]
+    async fn strict_rule_deadline_race_gone() {
+        let bad = Origin::spawn(Some(MIXED_BAD), true).await;
+        let slow = Origin::spawn(Some(NEW_RULES), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([
+            ("fast-bad".to_string(), http_provider(&bad.url, 0)),
+            ("slow".to_string(), http_provider(&slow.url, 0)),
+        ]);
+        // `load_pass`/`prefetch_within` run off the test runtime so the
+        // gated origin keeps answering.
+        let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::from_millis(50))).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, true).await;
+        for name in ["fast-bad", "slow"] {
+            let p = &providers[name];
+            assert_eq!(
+                p.rule_count(),
+                0,
+                "{name} registers empty regardless of timing"
+            );
+        }
+        assert!(matches!(
+            *providers["fast-bad"].initial_fetch.lock(),
+            InitialFetch::Retry
+        ));
+        assert!(matches!(
+            *providers["slow"].initial_fetch.lock(),
+            InitialFetch::Adopt(_)
+        ));
+        // The adopted download lands once the gate opens; the bad one
+        // heals when the publisher fixes the payload.
+        slow.gate.send_replace(true);
+        let fetch = providers["slow"].spawn_initial_fetch().unwrap();
+        eventually("the adopted download lands", || {
+            providers["slow"].rule_count() == 2
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .expect("the adopted fetch completes")
+            .unwrap();
+        *bad.body.lock() = Some(NEW_RULES);
+        providers["fast-bad"].spawn_initial_fetch().unwrap();
+        eventually("the retried payload heals", || {
+            providers["fast-bad"].rule_count() == 2
+        })
+        .await;
     }
 }

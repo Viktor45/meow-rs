@@ -7185,6 +7185,59 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
     server.abort();
 }
 
+/// Same lane discipline without a `proxy:` indirection. The test above
+/// exits `fetch_source` early via `deferred_initial`, so it would not
+/// catch a regression that loads *every* vehicle on the lane — a
+/// direct-dialed blackhole would stall there. Only `file:` providers may
+/// ever load synchronously during materialize (`is_file_vehicle`).
+#[tokio::test]
+async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt as _;
+    let state = test_state(test_raw_config());
+    let directory = tempfile::tempdir_in(
+        std::path::Path::new(state.config_path.as_deref().unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    // Accept the request and then stall forever, so an on-lane fetch
+    // would pin the commit behind the internal HTTP read timeout.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut buffer = [0; 2048];
+        let _ = stream.read(&mut buffer).await;
+        std::future::pending::<()>().await;
+    });
+    let yaml = format!(
+        "mode: rule\nproxy-providers:\n  pending:\n    type: http\n    url: http://{address}/proxies.yaml\n    path: {}\nrules: ['MATCH,DIRECT']\n",
+        directory.path().join("pending.yaml").display()
+    );
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/configs")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "payload": base64::engine::general_purpose::STANDARD.encode(yaml)
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        create_router(Arc::clone(&state)).oneshot(request),
+    )
+    .await
+    .expect("the commit must not fetch a remote provider on the lane")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(state.proxy_providers.contains_key("pending"));
+    server.abort();
+}
+
 /// `GET /logbook` and `DELETE /logbook`. The logbook is process-global and
 /// other tests in this binary may record into it while it is installed, so
 /// every read filters on this test's subject.
@@ -7543,4 +7596,187 @@ async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches()
     });
     let state = state_with_providers(&decl, dir.path()).await;
     assert_eq!(listed_subscription_info(&state, "usage").await, None);
+}
+
+// ── Option C: PUT /configs validates local `file:` provider payloads ──
+
+/// Commit `yaml` through `PUT /configs` (`?force=true` when `force`),
+/// returning the response status.
+async fn put_config_yaml(state: &Arc<AppState>, yaml: &str, force: bool) -> StatusCode {
+    use base64::Engine as _;
+    let uri = if force {
+        "/configs?force=true"
+    } else {
+        "/configs"
+    };
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "payload": base64::engine::general_purpose::STANDARD.encode(yaml)
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The directory that backs `test_state`'s `config_path` — `file:`/`http:`
+/// provider `path:` entries resolve inside it.
+fn backing_dir(state: &Arc<AppState>) -> std::path::PathBuf {
+    std::path::Path::new(state.config_path.as_deref().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Issue #533 Option C: a `file:` proxy-provider payload is operator-authored
+/// local content — under `strict` a malformed payload must reject the PUT
+/// with 400 and leave the live registry and raw config untouched (no
+/// `spawn_initial_fetch` side-effects, nothing recorded for a candidate
+/// that never commits). `?force=true` keeps the lenient escape: the bad
+/// node is warn-skipped and the provider commits empty.
+#[tokio::test]
+async fn put_configs_strict_rejects_malformed_file_provider_payload() {
+    let state = test_state(test_raw_config());
+    let dir = backing_dir(&state);
+    std::fs::write(
+        dir.join("bad.yaml"),
+        "proxies:\n  - {name: bad, type: nosuchtype}\n",
+    )
+    .unwrap();
+    let yaml = "strict: true\nmode: rule\nproxy-providers:\n  local:\n    type: file\n    path: bad.yaml\nproxy-groups:\n  - {name: G, type: select, use: [local]}\nrules: ['MATCH,G']\n";
+
+    let status = put_config_yaml(&state, yaml, false).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a strict file-payload defect must reject the candidate"
+    );
+    assert!(
+        state.proxy_providers.is_empty(),
+        "the rejected candidate must not register the provider"
+    );
+    assert!(
+        state.tunnel.proxy("G").is_none(),
+        "the route map must be untouched"
+    );
+    assert_eq!(
+        state.raw_config.read().rules.as_deref(),
+        Some(
+            [
+                "DOMAIN,example.com,DIRECT".to_string(),
+                "MATCH,REJECT".to_string()
+            ]
+            .as_slice()
+        ),
+        "the live raw config must be untouched"
+    );
+
+    // `?force=true` retries the same candidate leniently: the malformed
+    // node is warn-skipped and the provider commits (empty content).
+    let status = put_config_yaml(&state, yaml, true).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "force retains the lenient escape"
+    );
+    let provider = state.proxy_providers.get("local").unwrap();
+    assert!(
+        provider.proxies().is_empty(),
+        "lenient skips the unparseable node"
+    );
+}
+
+/// `strict: false` — the same malformed `file:` payload commits directly:
+/// the node is warn-skipped and the provider registers empty.
+#[tokio::test]
+async fn put_configs_lenient_commits_malformed_file_provider() {
+    let state = test_state(test_raw_config());
+    let dir = backing_dir(&state);
+    std::fs::write(
+        dir.join("bad.yaml"),
+        "proxies:\n  - {name: bad, type: nosuchtype}\n",
+    )
+    .unwrap();
+    let yaml = "mode: rule\nproxy-providers:\n  local:\n    type: file\n    path: bad.yaml\nproxy-groups:\n  - {name: G, type: select, use: [local]}\nrules: ['MATCH,G']\n";
+
+    let status = put_config_yaml(&state, yaml, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let provider = state.proxy_providers.get("local").unwrap();
+    assert!(provider.proxies().is_empty());
+}
+
+/// A well-formed `file:` payload commits with its nodes already loaded —
+/// the pre-commit load validates *and* populates (no second read needed),
+/// so `use:` groups have members the moment the PUT returns.
+#[tokio::test]
+async fn put_configs_commits_valid_file_provider_payload() {
+    let state = test_state(test_raw_config());
+    let dir = backing_dir(&state);
+    std::fs::write(
+        dir.join("nodes.yaml"),
+        "proxies:\n  - {name: n1, type: direct}\n",
+    )
+    .unwrap();
+    let yaml = "strict: true\nmode: rule\nproxy-providers:\n  local:\n    type: file\n    path: nodes.yaml\nproxy-groups:\n  - {name: G, type: select, use: [local]}\nrules: ['MATCH,G']\n";
+
+    let status = put_config_yaml(&state, yaml, false).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a valid strict file payload must commit"
+    );
+    let provider = state.proxy_providers.get("local").unwrap();
+    assert_eq!(
+        provider.proxies().len(),
+        1,
+        "the pre-commit load already populated the provider"
+    );
+}
+
+/// A malformed *remote* (`http:`) payload under `strict` must NOT reject
+/// the PUT: remote bytes are third-party content, so the provider commits
+/// empty and the detached acquisition retries it — no 400.
+#[tokio::test]
+async fn put_configs_strict_remote_payload_defect_commits_empty() {
+    let origin = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: "proxies:\n  - {name: bad, type: nosuchtype}\n",
+    })
+    .await;
+    let state = test_state(test_raw_config());
+    let yaml = format!(
+        "strict: true\nmode: rule\nproxy-providers:\n  remote:\n    type: http\n    url: {}\nproxy-groups:\n  - {{name: G, type: select, use: [remote]}}\nrules: ['MATCH,G']\n",
+        origin.url
+    );
+
+    let status = put_config_yaml(&state, &yaml, false).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a remote payload defect must degrade, not reject the PUT"
+    );
+    let provider = Arc::clone(state.proxy_providers.get("remote").unwrap().value());
+    assert!(
+        provider.proxies().is_empty(),
+        "the rejected remote payload registers the provider empty"
+    );
+    // The commit owes the detached initial fetch: the origin sees the
+    // first fetch plus a retry.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while origin.hits() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the committed provider must retry the bad payload in background");
 }
