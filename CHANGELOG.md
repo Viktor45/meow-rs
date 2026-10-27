@@ -305,6 +305,53 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`parse_raw_yaml` keeps the ADR-0007 binary shrink without the
+  `serde_json::Value` intermediate** (PR #827 follow-up): the config
+  document still parses exactly once with `serde-saphyr`, but into a
+  span-carrying, document-ordered `yaml_tree::YamlNode` tree that a
+  compact handwritten `serde::Deserializer` walks into `RawConfig` —
+  instead of a `serde_json::Value` round-trip plus a second overlay
+  parse. That restores the direct-path behavior the intermediate had
+  lost: `hosts:` and `dns.nameserver-policy:` keep YAML document order
+  (the overlay could only re-read them for a narrow field list), scalar
+  coercions like `port: "7890"` and `secret: 123456` apply again, an
+  unquoted number-like value reaches a string field as written
+  (`password: 000000` stays `000000`, `filter: 01` stays `01`), typed
+  errors carry `line N column M` plus a `dns.fallback-filter.geoip`-style
+  field path, non-finite floats reach typed `f64` fields instead of
+  collapsing to `null`, and a top-level sequence can no longer fill
+  `RawConfig` positionally. Merge expansion, duplicate-key rejection,
+  tag refusal, strict booleans and the depth budget stay with saphyr's
+  single event stream, and the explicit-tag verdicts the one-pass
+  resolution would otherwise erase are re-enforced from the tag each
+  node retains (`port: !!str 7890` still fails `invalid u16`,
+  `secret: !!int 42` still fails `cannot deserialize tagged scalar into
+  string`). Subscription, proxy-provider and rule-set payloads keep the
+  `serde_json::Value` ingest (`parse_yaml_value`), whose `BTreeMap` key
+  order is unchanged.
+
+  The tree carries each scalar's *resolved* form (string targets slice
+  the source spelling back out of the document), which shifts a few
+  pathological edges relative to the direct saphyr path, all
+  intentional:
+
+  - Map keys that saphyr's resolved-value dedup tells apart but that
+    read as the same string (`{1: a, "1": b}`) are *rejected* with
+    `duplicate mapping key` instead of the second silently overwriting
+    the first in the `String`-keyed map. Distinct spellings
+    (`{TrUe: a, "true": b}`) stay two keys, as before.
+  - A negative-zero literal (`port: -0`) resolves to integer `0` before
+    the tree sees it, so an unsigned field accepts it where the direct
+    path's text parse rejected the `-` prefix.
+  - `f64`-overflowing literals (`1e999`) land on the same non-finite
+    `Float` node the named `.inf`/`.nan` spellings produce, so a typed
+    `f64` field could no longer reject just the overflow forms — latent
+    only, since no `Raw*` field is float-typed.
+  - `!!timestamp` scalars fail where the direct path's text parse could
+    still feed an integer target (`port: !!timestamp 7890`), and
+    `!!binary` scalars stay accepted as strings (the
+    `ignore_binary_tag_for_string` option) but still have no byte-decode
+    path — as before, no `Raw*` field is byte-typed.
 - **`?proxy=` detection is now ASCII case-insensitive** —
   `?Proxy=`/`?PROXY=` on `tls://`/`https://` nameservers hard-error at
   config load instead of silently leaking the proxy name into the DoH

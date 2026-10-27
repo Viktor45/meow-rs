@@ -468,3 +468,501 @@ fn binary_tagged_scalar_delivers_as_string() {
         "a !!binary scalar must reach Value as a string, got: {v}"
     );
 }
+
+/// Pins the single-pass `parse_raw_yaml` (`Spanned<YamlNode>` tree +
+/// the crate's typed `Deserializer`) contract: empty / null documents
+/// normalize to an empty root mapping, and a single document carrying
+/// both `hosts` and `dns.nameserver-policy` (each with
+/// reverse-lexicographical keys and mid-map `<<:` merges) alongside
+/// `tun`, `sniffer`, and `listeners` sub-tables preserves both
+/// `IndexMap`s' exact YAML key order and all sibling fields.
+#[test]
+fn parse_raw_yaml_typed_tree_preserves_empty_doc_and_ordered_maps_together() {
+    for empty in ["", "null\n"] {
+        let raw = meow_config::parse_raw_yaml(empty)
+            .unwrap_or_else(|e| panic!("empty/null doc {empty:?} must parse: {e}"));
+        assert!(raw.mixed_port.is_none());
+        assert!(raw.hosts.is_none());
+        assert!(raw.dns.is_none());
+        assert!(raw.tun.is_none());
+        assert!(raw.sniffer.is_none());
+        assert!(raw.listeners.is_none());
+    }
+
+    let doc = r#"
+mixed-port: 7890
+mode: rule
+x-hosts-base: &hbase
+  "m-merged.example": 10.0.0.9
+  "k-shared.example": 10.0.0.8
+x-nsp-base: &nbase
+  "+.m-merged.example": 9.9.9.9
+  "+.k-shared.example": [4.4.4.4, 8.8.4.4]
+hosts:
+  "z-first.example": 10.0.0.1
+  <<: *hbase
+  "k-shared.example": [10.0.0.2, 10.0.0.3]
+  "a-last.example": 10.0.0.4
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+  nameserver-policy:
+    "+.z-first.example": 1.0.0.1
+    <<: *nbase
+    "+.k-shared.example": 2.2.2.2
+    "+.a-last.example": [3.3.3.3, 8.8.8.8]
+tun:
+  enable: true
+  device: meow0
+  mtu: 1400
+sniffer:
+  enable: true
+  timeout: 150
+  override-destination: true
+listeners:
+  - name: in-mixed
+    type: mixed
+    port: 17890
+"#;
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    assert_eq!(raw.mixed_port, Some(7890));
+    assert_eq!(raw.mode.as_deref(), Some("rule"));
+
+    let hosts = raw.hosts.expect("hosts present");
+    let host_keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(
+        host_keys,
+        [
+            "z-first.example",
+            "k-shared.example",
+            "a-last.example",
+            "m-merged.example",
+        ],
+        "hosts must keep YAML order (not BTreeMap lexicographical order)"
+    );
+    assert_eq!(
+        hosts["k-shared.example"].as_slice(),
+        ["10.0.0.2", "10.0.0.3"]
+    );
+    assert_eq!(hosts["m-merged.example"].as_slice(), ["10.0.0.9"]);
+
+    let dns = raw.dns.expect("dns present");
+    assert_eq!(dns.enable, Some(true));
+    assert_eq!(dns.enhanced_mode.as_deref(), Some("fake-ip"));
+    let nsp = dns.nameserver_policy.expect("nameserver-policy present");
+    let nsp_keys: Vec<&str> = nsp.keys().map(String::as_str).collect();
+    assert_eq!(
+        nsp_keys,
+        [
+            "+.z-first.example",
+            "+.k-shared.example",
+            "+.a-last.example",
+            "+.m-merged.example",
+        ],
+        "nameserver-policy must keep YAML order (not BTreeMap lexicographical order)"
+    );
+    assert_eq!(nsp["+.k-shared.example"].as_urls(), ["2.2.2.2"]);
+    assert_eq!(nsp["+.a-last.example"].as_urls(), ["3.3.3.3", "8.8.8.8"]);
+
+    let tun = raw.tun.expect("tun present");
+    assert!(tun.enable);
+    assert_eq!(tun.device.as_deref(), Some("meow0"));
+    assert_eq!(tun.mtu, Some(1400));
+
+    let sniffer = raw.sniffer.expect("sniffer present");
+    assert_eq!(sniffer.enable, Some(true));
+    assert_eq!(sniffer.timeout, Some(150));
+    assert_eq!(sniffer.override_destination, Some(true));
+
+    let listeners = raw.listeners.expect("listeners present");
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].name, "in-mixed");
+    assert_eq!(listeners[0].listener_type, "mixed");
+    assert_eq!(listeners[0].port, Some(17890));
+}
+
+// ── PR #827 review pins ──────────────────────────────────────────────────
+// The `serde_saphyr → serde_json::Value → from_value` staging lost five
+// behaviours the direct `RawConfig` path had. The `Spanned<YamlNode>` tree
+// + handwritten deserializer that replaced it must restore all of them.
+
+/// Review finding 3 (positional fill): `serde_json::from_value` accepted
+/// a top-level *sequence* whose element count matched `RawConfig`'s field
+/// count — the exact `[null,7891,null×38]` vector filled the struct
+/// positionally. The tree deserializer's `deserialize_struct` accepts
+/// only mappings, so the vector — and any nested sequence where a struct
+/// is expected — is a hard `expected mapping start` error again.
+#[test]
+fn top_level_sequence_cannot_fill_raw_config_positionally() {
+    let mut doc = String::from("[null,7891");
+    for _ in 0..38 {
+        doc.push_str(",null");
+    }
+    doc.push(']');
+    let err = meow_config::parse_raw_yaml(&doc).unwrap_err().to_string();
+    assert!(
+        err.contains("expected mapping"),
+        "a top-level sequence must not fill RawConfig positionally, got: {err}"
+    );
+
+    // A nested sequence where a struct belongs errors the same way —
+    // `dns:` is an `Option<RawDns>`, not a list.
+    let err = meow_config::parse_raw_yaml("dns:\n  - enable\n  - 1.1.1.1\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("expected mapping") && err.contains("dns"),
+        "a sequence under a struct field must error naming the field, got: {err}"
+    );
+}
+
+/// Review finding 2 (scalar type context): saphyr's typed methods parsed
+/// the scalar's *text*, so quoted scalars reach numeric/bool targets and
+/// resolved scalars coerce to text. The tree deserializer keeps the same
+/// contract.
+#[test]
+fn scalar_coercions_match_the_direct_path() {
+    let raw =
+        meow_config::parse_raw_yaml("secret: 123456\nport: \"7890\"\nipv6: \"true\"\n").unwrap();
+    assert_eq!(raw.secret.as_deref(), Some("123456"), "int → string");
+    assert_eq!(raw.port, Some(7890), "quoted int → u16");
+    assert_eq!(raw.ipv6, Some(true), "quoted bool → bool");
+
+    let raw = meow_config::parse_raw_yaml("tun:\n  mtu: \"1400\"\n").unwrap();
+    assert_eq!(raw.tun.unwrap().mtu, Some(1400), "quoted int → Option<u16>");
+
+    // Radix literals behave the same quoted and bare: `0x10` resolves to
+    // int 16; `"0x10"` parses its text through the same radix table.
+    assert_eq!(
+        meow_config::parse_raw_yaml("port: 0x10\n").unwrap().port,
+        Some(16)
+    );
+    assert_eq!(
+        meow_config::parse_raw_yaml("port: \"0x10\"\n")
+            .unwrap()
+            .port,
+        Some(16)
+    );
+
+    // …and every text that the direct path's int/bool parsers rejected
+    // still rejects: floats never coerce to ints, non-bool text fails
+    // strict booleans, and out-of-range ints error.
+    let err = meow_config::parse_raw_yaml("tun:\n  mtu: 1500.0\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("invalid u16"),
+        "float → u16 must fail, got: {err}"
+    );
+    let err = meow_config::parse_raw_yaml("ipv6: \"on\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("invalid boolean (strict mode expects true/false)"),
+        "quoted non-bool must fail strict booleans, got: {err}"
+    );
+    for doc in ["port: -5\n", "port: 70000\n", "port: 1_0_0_x\n"] {
+        assert!(
+            meow_config::parse_raw_yaml(doc).is_err(),
+            "{doc:?} must be an invalid u16"
+        );
+    }
+}
+
+/// Review finding 1 (non-finite collapse): under the `serde_json::Value`
+/// stage `.inf`/`.nan`/`1e999` became `Value::Null`, so `Option<u16>:
+/// .inf` silently deserialized to `None`. The tree keeps them `Float`
+/// nodes: a typed scalar target errors `invalid <ty>` — the direct
+/// path's verdict — and only a `serde_json::Value` field still flattens
+/// them to `null` (that visitor's own semantics).
+///
+/// (`Option<String>` legitimately *accepts* the literal — the direct path
+/// delivered `.inf` as the string `".inf"`, and the tree delivers the same
+/// source spelling. No `f64` field exists in `RawConfig`, so the typed-`f64`
+/// acceptance leg is covered by `non_finite_floats_pass_through` above.)
+#[test]
+fn non_finite_floats_error_on_typed_option_fields() {
+    for literal in [".inf", "-.inf", ".nan", "1e999"] {
+        for (doc, ty) in [
+            (format!("port: {literal}\n"), "u16"),
+            (format!("ipv6: {literal}\n"), "boolean"),
+            (format!("tun:\n  mtu: {literal}\n"), "u16"),
+        ] {
+            let err = meow_config::parse_raw_yaml(&doc).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("invalid {ty}")),
+                "`{literal}` into Option<{ty}> must error, got: {err}"
+            );
+        }
+        // The direct-path behaviour for string targets, kept.
+        let raw = meow_config::parse_raw_yaml(&format!("secret: {literal}\n")).unwrap();
+        assert_eq!(
+            raw.secret.as_deref(),
+            Some(literal),
+            "`secret: {literal}` delivers its source spelling, as the direct path did"
+        );
+        // And the `serde_json::Value` capture fields still flatten.
+        let raw = meow_config::parse_raw_yaml(&format!("firewall: {literal}\n")).unwrap();
+        assert_eq!(raw.firewall, Some(serde_json::Value::Null));
+    }
+}
+
+/// The `IndexMap` order is now the tree's own document order — no overlay
+/// pass exists. Single-sided pins prove each map preserves order without
+/// the other present.
+#[test]
+fn hosts_only_preserves_document_order() {
+    let raw = meow_config::parse_raw_yaml(
+        "hosts:\n  \"z-first.example\": 1.1.1.1\n  \"a-second.example\": 2.2.2.2\n  \"m-last.example\": 3.3.3.3\n",
+    )
+    .unwrap();
+    let hosts = raw.hosts.unwrap();
+    let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["z-first.example", "a-second.example", "m-last.example"]
+    );
+}
+
+#[test]
+fn nameserver_policy_only_preserves_document_order() {
+    let raw = meow_config::parse_raw_yaml(
+        "dns:\n  nameserver-policy:\n    \"+.z-first.example\": 1.1.1.1\n    \"+.a-second.example\": 2.2.2.2\n    \"+.m-last.example\": [3.3.3.3, 8.8.8.8]\n",
+    )
+    .unwrap();
+    let nsp = raw.dns.unwrap().nameserver_policy.unwrap();
+    let keys: Vec<&str> = nsp.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "+.z-first.example",
+            "+.a-second.example",
+            "+.m-last.example"
+        ]
+    );
+    assert_eq!(nsp["+.m-last.example"].as_urls(), ["3.3.3.3", "8.8.8.8"]);
+}
+
+/// JSON text is legal YAML 1.2: a flow document now keeps its written key
+/// order in `hosts`/`nameserver-policy` — something the
+/// `serde_json::Value` stage's `BTreeMap` sorted away. (The production
+/// `--config-string` path accepts JSON payloads this way.)
+#[test]
+fn json_flow_document_preserves_hosts_and_policy_order() {
+    let doc = concat!(
+        "{\"hosts\": {\"z.example\": \"1.1.1.1\", \"a.example\": \"2.2.2.2\"},",
+        " \"dns\": {\"nameserver-policy\": {\"+.z.example\": \"8.8.8.8\",",
+        " \"+.a.example\": [\"9.9.9.9\", \"4.4.4.4\"]}},",
+        " \"mixed-port\": 7890}"
+    );
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    let hosts = raw.hosts.unwrap();
+    let host_keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(host_keys, ["z.example", "a.example"]);
+    let nsp = raw.dns.unwrap().nameserver_policy.unwrap();
+    let nsp_keys: Vec<&str> = nsp.keys().map(String::as_str).collect();
+    assert_eq!(nsp_keys, ["+.z.example", "+.a.example"]);
+    assert_eq!(raw.mixed_port, Some(7890));
+}
+
+/// Empty/null spellings for the order-sensitive fields: `~`/absent value
+/// → `None`; `{}` → an *empty but present* map — the direct path's exact
+/// verdicts (an empty map is not null).
+#[test]
+fn empty_and_null_forms_for_ordered_fields() {
+    for doc in [
+        "hosts: ~\n",
+        "hosts:\n",
+        "hosts: null\n",
+        "dns:\n  nameserver-policy: ~\n",
+        "dns:\n  nameserver-policy:\n",
+    ] {
+        let raw =
+            meow_config::parse_raw_yaml(doc).unwrap_or_else(|e| panic!("{doc:?} must parse: {e}"));
+        assert!(raw.hosts.is_none(), "{doc:?}: hosts must be None");
+        if let Some(dns) = raw.dns.as_ref() {
+            assert!(
+                dns.nameserver_policy.is_none(),
+                "{doc:?}: nameserver-policy must be None"
+            );
+        }
+    }
+
+    let raw = meow_config::parse_raw_yaml("hosts: {}\n").unwrap();
+    assert_eq!(
+        raw.hosts.unwrap().len(),
+        0,
+        "empty hosts map is Some(empty)"
+    );
+    let raw = meow_config::parse_raw_yaml("dns:\n  nameserver-policy: {}\n").unwrap();
+    let nsp = raw.dns.unwrap().nameserver_policy.unwrap();
+    assert_eq!(nsp.len(), 0, "empty nameserver-policy is Some(empty)");
+
+    // A null `dns:` itself is a plain absent section.
+    let raw = meow_config::parse_raw_yaml("dns: null\n").unwrap();
+    assert!(raw.dns.is_none());
+}
+
+/// Review finding 4 (diagnostics): typed errors carry the leaf node's
+/// `line/column` plus the dotted field path accumulated through nested
+/// map values — `line 3 column 12: dns.fallback-filter.geoip: invalid
+/// boolean (strict mode expects true/false)`.
+#[test]
+fn typed_errors_carry_line_column_and_field_path() {
+    let doc = "dns:\n  fallback-filter:\n    geoip: maybe\n";
+    let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+    assert!(
+        err.contains("line 3 column 12") && err.contains("dns.fallback-filter.geoip"),
+        "expected `line 3 column 12: dns.fallback-filter.geoip: …`, got: {err}"
+    );
+    assert!(err.contains("invalid boolean"), "got: {err}");
+
+    // Sequence indices fuse onto the segment: `listeners[0].port`
+    // (`proxies:` entries stay untyped `serde_json::Value` maps, so the
+    // pin uses a typed `RawListener` element).
+    let doc = "listeners:\n  - name: l\n    type: mixed\n    port: nope\n";
+    let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+    assert!(
+        err.contains("listeners[0].port") && err.contains("invalid u16"),
+        "expected the `[i]`-indexed field path, got: {err}"
+    );
+}
+
+/// The same leaf location on a top-level scalar: `port: abc` reports the
+/// value's column — `line 3 column 7: port: invalid u16`.
+#[test]
+fn top_level_scalar_error_reports_value_column() {
+    let doc = "mixed-port: 7890\nmode: rule\nport: abc\n";
+    let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+    assert!(
+        err.contains("line 3 column 7") && err.contains("port") && err.contains("invalid u16"),
+        "expected `line 3 column 7: port: invalid u16`, got: {err}"
+    );
+}
+
+/// Non-string scalar keys into a `String`-keyed map get the key's source
+/// spelling, as on the direct path (`0x1F` stays `"0x1F"`, not `"31"`). A
+/// null key errors on both paths.
+#[test]
+fn scalar_map_keys_keep_source_text() {
+    let doc = "hosts:\n  123: 1.1.1.1\n  ~: 2.2.2.2\n";
+    let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+    assert!(
+        err.contains("null"),
+        "a `~` key must fail like the direct path's NullIntoString, got: {err}"
+    );
+
+    let raw = meow_config::parse_raw_yaml(
+        "hosts:\n  123: 1.1.1.1\n  plain.example: 2.2.2.2\n  0x1F: 3.3.3.3\n  +7: 4.4.4.4\n",
+    )
+    .unwrap();
+    let hosts = raw.hosts.unwrap();
+    let keys: Vec<&str> = hosts.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["123", "plain.example", "0x1F", "+7"]);
+}
+
+/// Two keys saphyr's resolved-value dedup tells apart can still read as
+/// the same string — `1` (an int) and `"1"`. The tree's
+/// `IndexMap<String, _>` target would let the second silently overwrite
+/// the first, so the document is rejected instead — an intentional
+/// narrowing. Distinct spellings of one value (`TrUe`/`"true"`,
+/// `1.0`/`"1"`) are distinct strings and stay two keys, as on the direct
+/// path.
+#[test]
+fn same_string_key_collision_is_an_error() {
+    for doc in [
+        "hosts:\n  1: 1.1.1.1\n  \"1\": 2.2.2.2\n",
+        "dns:\n  nameserver-policy:\n    0x1F: 1.1.1.1\n    \"0x1F\": 2.2.2.2\n",
+    ] {
+        let err = meow_config::parse_raw_yaml(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate mapping key"),
+            "{doc:?} must fail as a same-string duplicate, got: {err}"
+        );
+    }
+
+    let raw =
+        meow_config::parse_raw_yaml("hosts:\n  TrUe: 1.1.1.1\n  \"true\": 2.2.2.2\n").unwrap();
+    let hosts = raw.hosts.unwrap();
+    assert_eq!(
+        hosts.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["TrUe", "true"]
+    );
+    let raw = meow_config::parse_raw_yaml(
+        "dns:\n  nameserver-policy:\n    1.0: 1.1.1.1\n    \"1\": 2.2.2.2\n",
+    )
+    .unwrap();
+    let policy = raw.dns.unwrap().nameserver_policy.unwrap();
+    assert_eq!(
+        policy.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["1.0", "1"]
+    );
+}
+
+/// PR #827 review: an unquoted value that YAML resolves to a number or
+/// bool reaches a `String` field as it was written. A rewritten listener
+/// password or API secret would lock clients out, and `filter: 01` is not
+/// the regex `1`.
+#[test]
+fn number_like_strings_keep_source_text() {
+    let doc = "\
+secret: 012345
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    port: 8388
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: 000000
+  - name: ss-in2
+    type: shadowsocks
+    port: 8389
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: 123e4567
+  - name: &n 0123
+    type: shadowsocks
+    port: 8390
+    listen: 127.0.0.1
+    cipher: aes-128-gcm
+    password: *n
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [DIRECT]
+    filter: 01
+    exclude-filter: 0x1F
+";
+    let raw = meow_config::parse_raw_yaml(doc).unwrap();
+    assert_eq!(raw.secret.as_deref(), Some("012345"));
+    let passwords: Vec<Option<&str>> = raw
+        .listeners
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|l| l.password.as_deref())
+        .collect();
+    assert_eq!(
+        passwords,
+        [Some("000000"), Some("123e4567"), Some("0123")],
+        "an alias delivers its anchor's spelling"
+    );
+    let group = &raw.proxy_groups.as_deref().unwrap()[0];
+    assert_eq!(group.filter.as_deref(), Some("01"));
+    assert_eq!(group.exclude_filter.as_deref(), Some("0x1F"));
+}
+
+/// PR #827 review: an error raised by serde's own visitor (no
+/// `HostsValue` variant matches) points at the value, not at its key.
+#[test]
+fn visitor_error_points_at_the_value() {
+    let err = meow_config::parse_raw_yaml("mode: rule\nhosts:\n  a.example: [1, 2]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("line 3 column 14") && err.contains("hosts.a.example"),
+        "expected `line 3 column 14: hosts.a.example: …`, got: {err}"
+    );
+}

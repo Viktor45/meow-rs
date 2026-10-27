@@ -29,6 +29,7 @@ pub mod subscription;
 pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
+mod yaml_tree;
 
 pub use dropped_providers::DroppedProviders;
 pub use geodata::GeoDataConfig;
@@ -753,9 +754,11 @@ pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error
 }
 
 /// Upper bound on YAML document nesting for remote-controlled documents.
-/// `serde_saphyr` deserializes `serde_json::Value` recursively — a document
-/// of `[[[[…` or of ever-deepening indentation recurses one stack frame per
-/// level and can overflow a blocking-thread stack well inside the
+/// `serde_saphyr` deserializes its targets recursively — both the
+/// `serde_json::Value` ingest (`parse_yaml_value`) and the
+/// `yaml_tree::SpannedNode` build (`parse_raw_yaml`) recurse one stack
+/// frame per level, so a document of `[[[[…` or of ever-deepening
+/// indentation can overflow a blocking-thread stack well inside the
 /// fetch-size caps (issue #533 review). Two cheap over-approximations bound
 /// the depth up front:
 ///
@@ -810,12 +813,16 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 ///   delivers as a plain string, matching norway.
 /// - `non_finite_float_policy: PassThrough`: `.inf`/`-.inf`/`.nan` map to
 ///   `null` inside `serde_json::Value` subtrees and to the IEEE values in
-///   typed `f64` fields — norway's exact behaviour.
-/// - `budget.max_depth`: saphyr's `serde_json::Value` deserializer
-///   recurses one stack frame per nesting level, so the depth bound must
-///   trip inside the parser before the descend overflows — the value is
-///   `meow_common::yaml::MAX_DEPTH` (32), the single definition meow-cli's
-///   config parse shares so every front-end enforces the same contract.
+///   typed `f64` fields — norway's exact behaviour. Under `parse_raw_yaml`
+///   the span tree keeps them as `YamlNode::Float`, so `Option<u16>: .inf`
+///   is the same `invalid u16` the direct path reported rather than a
+///   silent `None` (PR #827 review).
+/// - `budget.max_depth`: both saphyr targets (`serde_json::Value` and the
+///   `yaml_tree` node tree) deserialize recursively, one stack frame per
+///   nesting level, so the depth bound must trip inside the parser before
+///   the descend overflows — the value is `meow_common::yaml::MAX_DEPTH`
+///   (32), the single definition meow-cli's config parse shares so every
+///   front-end enforces the same contract.
 ///   The budget is only a real guard because every parse below runs on a
 ///   dedicated `meow_common::yaml::PARSE_STACK_SIZE` thread: on the 1 MiB
 ///   main thread the fatal depth measured ≈25 — *below* 32 — so an inline
@@ -830,6 +837,14 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 /// Stays crate-private: backend types must never sit in a `pub` signature
 /// (`serde_json::Value` is the public value namespace), so sibling modules
 /// ingest through [`parse_yaml_value`] below.
+///
+/// Production ingest really does funnel through `parse_raw_yaml` and
+/// `parse_yaml_value` only: the ~90 `serde_saphyr::from_str` call sites
+/// left in this crate's `src/*.rs` all sit inside `#[cfg(test)]` modules
+/// and deliberately pin *direct-path* semantics — the contract reference
+/// the `yaml_tree` deserializer is held to. The single direct use outside
+/// this crate is meow-cli's two-field `ConfigDoc` reader, which mirrors
+/// this option profile by hand.
 fn yaml_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         strict_booleans: true,
@@ -873,11 +888,29 @@ fn yaml_ser_options() -> serde_saphyr::SerializerOptions {
 /// mapping with explicit keys taking precedence — the same expansion
 /// `serde_yaml::Value::apply_merge` used to perform. Upstream mihomo
 /// configs (e.g. `rule-anchor` patterns) rely on this — see meow-ios#112.
+///
 /// Shared YAML→[`raw::RawConfig`] entry — nesting-depth guard plus
 /// merge-key expansion. Every untrusted config ingest point (config file,
 /// subscription/provider payloads, and `PUT /configs`) must use this so a
 /// remotely-supplied document can't bypass the depth bound or silently
 /// lose merged fields (issue #648 review).
+///
+/// Deserialization is one pass over the `serde_saphyr` event stream: the
+/// parser (still enforcing `<<:` merge expansion, `DuplicateKeyPolicy::Error`,
+/// `reject_unsupported_tags`, `strict_booleans`,
+/// `NonFiniteFloatPolicy::PassThrough`, and `budget.max_depth` via
+/// `yaml_options`) materializes a `yaml_tree::YamlNode` tree inside
+/// `yaml_tree::SpannedNode` wrappers — scalar type, document order and
+/// every node's `line:column` retained — and `yaml_tree`'s compact
+/// `serde::Deserializer` walks the tree into [`raw::RawConfig`]. Routing the
+/// 17-struct/4-untagged-enum `RawConfig` tree through that small handwritten
+/// deserializer, instead of `serde_saphyr`'s streaming
+/// `deserialize_map`/`deserialize_struct` state machines monomorphized
+/// across every `Raw*` type, keeps the `minimal` binary within the
+/// ADR-0007 size budget — while restoring the scalar coercions
+/// (`port: "7890"`, `secret: 123456`), `hosts`/`nameserver-policy` document
+/// order, and `line {l} column {c}`/`field.path` diagnostics a
+/// `serde_json::Value` intermediate had lost (PR #827).
 pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     if !yaml_within_depth(content) {
         return Err(anyhow::anyhow!(
@@ -891,11 +924,12 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    let raw = meow_common::yaml::run_on_parse_stack(content, |doc| {
-        serde_saphyr::from_str_with_options(doc, yaml_options())
+    meow_common::yaml::run_on_parse_stack(content, |doc| {
+        let root: yaml_tree::SpannedNode =
+            serde_saphyr::from_str_with_options(doc, yaml_options())?;
+        yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
     })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?;
-    Ok(raw?)
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —
